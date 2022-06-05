@@ -1,0 +1,348 @@
+#+title: DeepVariant Benchmarking
+
+* Introduction
+
+DeepVariant is an open-source convolutional neural network pipeline designed by
+Google in order to facilitate variant calling on diploid organisms, trained on human
+genome and exome data.
+
+DeepVariant is actually a pipeline constructed of three larger components:
+- A wrapper script that handles all the stages of the pipeline and allows for one-command
+  runs (=run_deepvariant.py=)
+- A script responsible for generating pileup images as input data for the convolutional network,
+  which are generated from aligned BAM read files as well as reference genome files. (=make_examples.py=)
+- The script that runs the CNN (=call_variants.py=).
+
+We will look into the steps necessary in order to benchmark the system, as well
+as potentially increase the performance of the pipeline's runtime.
+
+* VM Setup
+
+Google generously provides a Docker container that is fully setup to run
+DeepVariant; unfortunately, though, this container is not befit of benchmarking
+due to the usage of runnable Python zip archives as the build method for
+DeepVariant; this is the method available by default in Bazel, the build tool
+used by DeepVariant. In order to properly benchmark the software, building from source
+is necessary. Using a VM is the safest and cleanest way to benchmark the software.
+
+DeepVariant only supports Ubuntu 20.04 LTS, so this is the ISO image you'll have to use
+to replicate the steps below. The hardware requirements for the VM have not been tested,
+but empirically, I found that the following are required:
+- 8 GB RAM
+- at least 25 GB of disk storage (I recommend at least 35 GB)
+- as many CPU and GPU cores as can be provided
+
+The steps for creating an instance of a fresh Ubuntu VM is out of the scope of
+this work log, but there are numerous guides on the internet one can use;
+quick Google shows [[https://brb.nci.nih.gov/seqtools/installUbuntu.html][this guide]] which covers pretty much what I did. I did personally pick
+to make a dynamically allocated disk image instead of a fixed size due to personal storage
+constraints; you can also do the same.
+
+* Dependency Installation
+
+There are a couple of build dependencies that are needed to install DeepVariant
+that don't come with Ubuntu, so let's get those:
+
+#+begin_src sh
+sudo apt update && \
+sudo apt upgrade && \
+# For building and cloning DeepVariant
+sudo apt install -y curl wget git build-essential perl make python3 python3-pip
+# Making sure runtime dependencies exist
+sudo apt install -y parallel
+# Making sure we can persist sessions after SSH, we'll use GNU Screen
+sudo apt install -y screen
+#+end_src
+
+Afterwards, we can get the DeepVariant repo:
+
+#+begin_src sh
+git clone https://github.com/google/deepvariant
+cd deepvariant/
+#+end_src
+
+Google also provides a script that installs additional Python packages needed to
+build DeepVariant, so we'll run that. This will take a while (about 10 minutes):
+
+#+begin_src sh
+./build-prereq.sh
+#+end_src
+
+Next, just build DeepVariant itself:
+
+#+begin_src sh
+./build_and_test.sh
+#+end_src
+
+This will take about 30 minutes. After that, the VM is ready to go for benchmarking.
+
+* Original Docker Benchmark
+
+Before the VM setup was made, a Docker container was provisioned on a Kubernetes
+cluster in order to test the [[https://github.com/google/deepvariant/blob/r1.3/docs/deepvariant-quick-start.md][Quick Start]] guide provided by Google in order to
+test DeepVariant. After the initial test was run, an additional test was run in order
+to compare the different available DeepVariant models and their performance on the runtime.
+
+To deploy the Docker container, this K8S YAML file was used:
+
+#+begin_src yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: deepvariant-benchmark
+  labels:
+    name: deepvariant-benchmark
+spec:
+  containers:
+  - name: deepvariant-benchmark
+    image: google/deepvariant:1.3.0
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/sh"]
+    args: ["-c", "sleep 36500000"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+  restartPolicy: OnFailure
+#+end_src
+
+To connect to a shell, this command was used:
+#+begin_src sh
+kubectl exec deepvariant-benchmark -n seelab -it -- bash
+#+end_src
+
+
+The benchmarking was done with a simple shell script, after following the DeepVariant guide
+within the Docker container:
+
+#+begin_src sh
+#!/bin/bash
+
+OUTPUT_DIR="./quickstart-output"
+mkdir -p "$OUTPUT_DIR"
+for model in "WGS" "WES" "PACBIO" "HYBRID_PACBIO_ILLUMINA"; do
+        echo "Executing DeepVariant for model $model..."
+        ./bin/run_deepvariant \
+                --model_type=$model \
+                --ref=./quickstart-testdata/ucsc.hg19.chr20.unittest.fasta \
+                --reads=./quickstart-testdata/NA12878_S1.chr20.10_10p1mb.bam \
+                --regions "chr20:10,000,000-11,000,000" \
+                --output_vcf=$OUTPUT_DIR/output.vcf.gz \
+                --output_gvcf=$OUTPUT_DIR/output.g.vcf.gz \
+                --intermediate_results_dir=$OUTPUT_DIR/intermediate_results_dir \
+                --num_shards=$(nproc --all) \
+                --logging_dir=$OUTPUT_DIR/logs \
+                --runtime_report=true >> "$model.stdout.log" "$model.stderr.log"
+        echo "Done!"
+        echo "Zipping run..."
+        echo "======"
+        cd "$OUTPUT_DIR"; zip -r "../$model.run.zip" .
+        cd ..
+        echo "======"
+        echo "Resetting..."
+        rm -r "$OUTPUT_DIR"
+        mkdir -p "$OUTPUT_DIR"
+done
+#+end_src
+
+In general, most models took about the same runtime in total. The runtimes will
+be listed in the order of the elements of the pipeline (first =make_examples=,
+then =call_variants= and then =postprocess_variants=) and they can be found in
+each model's stdout log file:
+- =HYBRID_PACBIO_ILLUMINA=: 8.468 s + 14.094 s + 3.588 s = 26.15s
+- =PACBIO=: 8.287 s + 14.450 s + 3.637 s = 26.374 s
+- =WES=: 8.453 s + 14.935 s + 3.546 s = 26.934 s
+- =WGS=: 8.463 s + 14.655 s + 3.682 s = 26.8 s
+
+As we can see, the =call_variants= stage takes the most amount of time, which is
+intuitive since it's the neural network part of the pipeline; however, neural
+networks are difficult to optimize in performance without changing the model
+architecture, which could be done, but might affect accuracy. Before approaching
+optimizing the neural network, however, a notable issue is the total user time
+for =make_examples= is high; upwards of 1 minute of userland time are used by
+=make_examples=. The times are reduced due to the usage of GNU Parallel in order
+to parallelize the creation of pileup images; the issue, however, stems in
+environments with cheap hardware; notably that processors may not be multi-core
+or as performant as the CPU cores used in the Nautilus Kubernetes cluster.
+
+Either way, we'll begin with profiling =make_examples= to see what is the
+largest part of the runtime.
+
+* Profiling =make_examples=
+
+=make_examples= is part of the DeepVariant library and uses various C bindings
+in order to quickly find potential candidates for variants from the original
+reference genomes, saves the positions of the candidates from the reads and
+generates images according to the inputs that DeepVariant takes.
+
+To do this, we'll use cProfile on the original source code in order to quickly
+find the problem spots. This can be done by wrapping the runner function with cProfile
+in the original source code:
+
+#+begin_src diff
+diff --git a/deepvariant/make_examples_core.py b/deepvariant/make_examples_core.py
+index b531dfb7..c153f989 100644
+--- a/deepvariant/make_examples_core.py
++++ b/deepvariant/make_examples_core.py
+@@ -31,6 +31,7 @@
+ import collections
+ import dataclasses
+ import os
++import cProfile
+ import time
+ from typing import Dict, List, Optional, Sequence, Tuple
+
+@@ -1619,6 +1620,8 @@ def get_example_counts(examples, num_classes):
+
+ def make_examples_runner(options):
+   """Runs examples creation stage of deepvariant."""
++  pr = cProfile.Profile()
++  pr.enable()
+   resource_monitor = resources.ResourceMonitor().start()
+   before_initializing_inputs = time.time()
+
+@@ -1746,3 +1749,5 @@ def make_examples_runner(options):
+
+   logging_with_options(options, 'Found %s candidate variants' % n_candidates)
+   logging_with_options(options, 'Created %s examples' % n_examples)
++  pr.disable()
++  pr.dump_stats("make_examples_core.prof")
+#+end_src
+
+After that, we can simply build the entire program and run =make_examples=:
+
+#+begin_src sh
+./build_and_test.sh
+python3 bazel-out/k8-opt/bin/deepvariant/make_examples.zip \
+    --regions "chr20:10,000,000-11,000,000" \
+    --examples "examples.tfproto" \
+    --mode calling \
+    --reads "quickstart-testdata/NA12878_S1.chr20.10_10p1mb.bam" \
+    --ref "quickstart-testdata/ucsc.hg19.chr20.unittest.fasta"
+#+end_src
+
+Running the command generates a cProfile dump that can be used to evaluate the
+performance of the script. While we could read the original dump using pStats
+from Python 3, flamegraphs yield a better visual representation of the data.
+We'll use =flameprof=, a Python library, to generate these:
+
+#+begin_src sh
+pip3 install flameprof
+python3 -m flameprof make_examples_core.prof > make_examples_core.svg
+#+end_src
+
+We can also generate PDF's using librsvg, which I recommend:
+#+begin_src sh
+sudo apt install -y librsvg2-bin
+rsvg-convert -h 1080 make_examples_core.svg -o make_examples_core.png
+#+end_src
+
+For the above command run, we yield this flamegraph:
+#+CAPTION: The flamegraph for the DeepVariant =make_examples= run above.
+#+ATTR_LATEX: :scale 0.2 :center
+[[./img/2022-04-27-deepvariant-small-flamegraph.png]]
+
+By far the biggest performance hit on =make_examples= is AlleleCounter's
+=counts= method, which is a C-bound method. This also seems to become
+progressively worse as the region range increases, since finding candidates from
+the entire chromosome 20 seems to explode the runtime of the =counts= method.
+
+#+CAPTION: The flamegraph for =make_examples= over =chr20:0-63,000,000=.
+#+ATTR_LATEX: :scale 0.1 :center
+[[./img/2022-04-27-deepvariant-big-flamegraph.png]]
+
+This runtime seems to quickly become the dominant cumulative runtime of
+=make_examples=. 28.43% of the runtime in the original run is taken by the
+=counts= method, whereas
+
+#+begin_src sh
+echo "sort cumtime\nstats" | python3 -m pstats ~/make_examples_core.prof
+#+end_src
+
+#+begin_example
+ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+63000    2.346    0.000  688.274    0.011
+/tmp/Bazel.runfiles_qw08li6k/runfiles/com_google_deepvariant/deepvariant/make_examples_core.py:934(process)
+63000   36.145    0.001  628.751    0.010
+/tmp/Bazel.runfiles_qw08li6k/runfiles/com_google_deepvariant/deepvariant/make_examples_core.py:1104(candidates_in_region)
+63000   34.161    0.001  505.866    0.008
+/tmp/Bazel.runfiles_qw08li6k/runfiles/com_google_deepvariant/deepvariant/variant_caller.py:348(calls_and_gvcfs)
+63000    0.278    0.000  471.705    0.007 /tmp/Bazel.runfiles_qw08li6k/runfiles/com_google_deepvariant/deepvariant/very_sensitive_caller.py:52(get_candidates)
+63000    0.179    0.000  369.678    0.006
+/tmp/Bazel.runfiles_qw08li6k/runfiles/com_google_deepvariant/deepvariant/very_sensitive_caller.py:57(<dictcomp>)
+63000  369.499    0.006  369.499    0.006
+{method 'counts' of 'deepvariant.python.allelecounter.AlleleCounter' objects}
+#+end_example
+
+This accounts for approximately 53.68% of the runtime of the executable, which is significant.
+
+* Memory Access Benchmarking
+
+Since we have found a few key regions in which runtime performance could be
+improved, we thought it pertinent to try benchmarking =make_examples= from
+different potential viewpoints outside of runtime performance. Particularly, it
+is possible that memory could be a bottleneck to the performance of this
+program, a insight pointed out by Dr. Rosing. As such, we'll proceed with
+benchmarking the memory access and cache misses of DeepVariant using Intel's
+vTune Profiler.
+
+To do so, one must first install the profiler, of which there are [[https://www.intel.com/content/www/us/en/develop/documentation/installation-guide-for-intel-oneapi-toolkits-linux/top/installation/install-using-package-managers/apt.html][tutorials]]
+given by Intel:
+
+#+begin_src sh
+wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+| gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+
+# add signed entry to apt sources and configure the APT client to use Intel repository:
+echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+| sudo tee /etc/apt/sources.list.d/oneAPI.list
+#+end_src
+
+Note that memory access benchmarking will not work in a VM, but must be done in
+a bare-metal environment.
+
+Once vTune is installed, we can use the GUI to initiate memory profiling. We did
+notice a few concerns with the kernel being misconfigured such that we could not
+run benchmarks on the bare-metal machine available, however the GUI was
+informative enough to provide the commands necessary to fix the issue.
+
+We decided to run the last command we've done in our previous section, notably
+variant calling the reads of the entire 20th chromosome. We estimated it would
+take about 50 GB of storage in order to store the profiling results, which seemed
+to be enough.
+
+[[./img/deepvariant-vtune-benchmark-summary.png]]
+
+As we can see, the first stage of the pipeline is not significantly bound
+by memory, and this seems to correlate with the memory latency timings,
+which demonstrate not much time is spent on memory loads and stores.
+
+[[./img/deepvariant-vtune-benchmark-graph.png]]
+
+Most of the calls to DRAM took less than 2 msec to run, which is reasonably low.
+
+* Future Steps
+
+In the future, we look to analyze the pipeline more in-depth. For instance,
+we'll continue to stress-test the pipeline at higher levels of load in order to
+see if there any other exponential changes in runtime or memory efficiency. Once
+resources are secured, the pipeline will be tested under both of the above
+methods by variant calling over an entire genome. Additionally, we'll look into
+analyzing the third part of the pipeline, =postprocess_variants=, to see if
+there are improvements to be made there as well.
+
+Lastly, there could be further work done looking into if it's possible to implement
+multiprocessing in =make_examples= in order to circumvent the need to use external
+parallelization to improve the runtime, but this remains to be seen with further testing.
+
+* Final Thoughts
+
+Due to DeepVariant's programming language choice being Python, there are
+particular sections of the pipeline that continue to be slow and would benefit
+from multi-threading.  As we've seen, =make_examples= is a CPU-bound program
+that could benefit from potentially more efficient multi-threading.
+
+Thankfully, work has already been done in order to improve DeepVariant's
+performance in other contexts. Notably, Google has collaborated with Intel in
+order to leverage the AVX-512 acceleration platform, which has yielded [[https://google.github.io/deepvariant/posts/2019-04-30-the-power-of-building-on-an-accelerating-platform-how-deepVariant-uses-intels-avx-512-optimizations/][great
+results.]] Perhaps DeepVariant can be written to compile to even higher
+performance platforms, such as GPU's or FPGA's.
