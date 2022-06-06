@@ -4,7 +4,10 @@
 
 DeepVariant is an open-source convolutional neural network pipeline designed by
 Google in order to facilitate variant calling on diploid organisms, trained on human
-genome and exome data.
+genome and exome data. The pipeline is more accurate than other state-of-the-art
+variant callers [fn:nature-paper]
+
+[fn:nature-paper] As per [[https://www.nature.com/articles/nbt.4235][this paper]].
 
 DeepVariant is actually a pipeline constructed of three larger components:
 - A wrapper script that handles all the stages of the pipeline and allows for one-command
@@ -346,3 +349,9 @@ performance in other contexts. Notably, Google has collaborated with Intel in
 order to leverage the AVX-512 acceleration platform, which has yielded [[https://google.github.io/deepvariant/posts/2019-04-30-the-power-of-building-on-an-accelerating-platform-how-deepVariant-uses-intels-avx-512-optimizations/][great
 results.]] Perhaps DeepVariant can be written to compile to even higher
 performance platforms, such as GPU's or FPGA's.
+
+* References
+
+- [[https://www.nature.com/articles/nbt.4235][A universal SNP and small-indel variant caller using deep neural networks, Nature, 2018.]]
+- [[https://google.github.io/deepvariant/][DeepVariant Blog, Google Health.]]
+- [[https://www.intel.com/content/www/us/en/architecture-and-technology/avx-512-overview.html][Intel AVX-512 main website]]
